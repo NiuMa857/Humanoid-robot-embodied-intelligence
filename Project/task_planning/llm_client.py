@@ -1,36 +1,83 @@
-"""云端 LLM / VLM 客户端(对齐 Readme §8.4 + QUESTIONS D1)。
+"""云端 / 本地 LLM/VLM 客户端(完整实装)。
 
-按 D1 决策:同时保留两种调用方式,通过统一抽象 + 工厂方法注入:
-  - RemoteLLMClient:HTTP REST 调云端(OpenAI/DeepSeek/自建 API)
-  - LocalLLMClient:本地推理(vLLM / TGI / llama.cpp,OpenAI-compatible 协议)
-
-机内 → 服务器的 WebSocket 桥放在 `communication/websocket_bridge/`(后续 M2 落)。
-这里只关心 LLM 协议层。
+用 httpx(支持 async / HTTP/2 / 流式)。如果没装会自动 fallback 到 urllib。
 """
 from __future__ import annotations
+import json
 import time
 from abc import ABC, abstractmethod
 from typing import Any
+
+from common.logging import setup_logger
+
+_log = setup_logger("llm_client")
+
+
+# ============================================================
+# HTTP 后端(优先 httpx,fallback urllib)
+# ============================================================
+
+def _http_post(url: str, json_body: dict, headers: dict, timeout_s: float) -> dict:
+    """POST JSON,返回响应 dict。"""
+    try:
+        import httpx
+        with httpx.Client(timeout=timeout_s) as client:
+            r = client.post(url, json=json_body, headers=headers)
+            r.raise_for_status()
+            return r.json()
+    except ImportError:
+        import urllib.request, urllib.error
+        req = urllib.request.Request(
+            url, data=json.dumps(json_body).encode("utf-8"),
+            headers={**headers, "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"HTTP {e.code}: {e.read().decode('utf-8', errors='replace')}") from e
+
+
+def _http_get(url: str, headers: dict, timeout_s: float) -> bytes:
+    """GET 字节流。"""
+    try:
+        import httpx
+        with httpx.Client(timeout=timeout_s) as client:
+            r = client.get(url, headers=headers)
+            r.raise_for_status()
+            return r.content
+    except ImportError:
+        import urllib.request
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            return resp.read()
 
 
 # ============================================================
 # LLM 抽象基类
 # ============================================================
 
-class BaseLLMClient(ABC):
-    """LLM 客户端统一接口(Remote / Local 共用)。"""
+class LLMError(Exception):
+    """LLM 调用失败(超时 / 解析错误 / HTTP 错误)。"""
+    pass
 
-    def __init__(self, timeout_s: float = 2.0, **kwargs):
+
+class BaseLLMClient(ABC):
+    """LLM 客户端统一接口。"""
+
+    def __init__(self, timeout_s: float = 2.0, max_retries: int = 1, **kwargs):
         self.timeout_s = timeout_s
+        self.max_retries = max_retries
 
     @abstractmethod
     def understand_instruction(self, text: str) -> dict:
-        """自然语言 -> TaskGoal dict。"""
+        """自然语言 → TaskGoal dict。"""
         ...
 
     @abstractmethod
     def decompose(self, goal: dict, scene: dict) -> list[dict]:
-        """任务分解 -> SkillSequence(原始 dict 列表,调用方负责包装 Skill)。"""
+        """任务分解 → Skill 列表(原始 dict)。"""
         ...
 
     @abstractmethod
@@ -38,20 +85,31 @@ class BaseLLMClient(ABC):
         """重规划(失败后调用)。"""
         ...
 
+    def _retry(self, fn, *args, **kwargs) -> Any:
+        """带重试的调用(指数 backoff)。"""
+        last_err = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as e:
+                last_err = e
+                if attempt < self.max_retries:
+                    wait = 0.2 * (2 ** attempt)
+                    time.sleep(wait)
+        raise LLMError(f"after {self.max_retries + 1} attempts: {last_err}") from last_err
+
     def close(self) -> None:
-        """释放连接(R1:子类按需覆盖)。"""
         pass
 
 
 # ============================================================
-# Remote 实现:HTTP REST 调云端
+# Remote 实现:OpenAI-compatible 协议
 # ============================================================
 
 class RemoteLLMClient(BaseLLMClient):
-    """云端 LLM 客户端(POST/JSON,2s 超时)。
+    """云端 LLM 客户端(POST/JSON)。
 
-    适配 OpenAI-compatible 协议(/v1/chat/completions),覆盖:
-      - OpenAI / Anthropic(走代理)/ DeepSeek / 智谱 / 自建 OpenAI-compatible API
+    适配 OpenAI-compatible `/v1/chat/completions`(覆盖 OpenAI/DeepSeek/智谱/自建等)。
     """
 
     def __init__(
@@ -62,134 +120,141 @@ class RemoteLLMClient(BaseLLMClient):
         timeout_s: float = 2.0,
         max_retries: int = 1,
     ):
-        super().__init__(timeout_s=timeout_s)
+        super().__init__(timeout_s=timeout_s, max_retries=max_retries)
         self.endpoint = endpoint.rstrip("/")
         self.api_key = api_key
         self.model = model
-        self.max_retries = max_retries
-        # TODO: 用 httpx.AsyncClient(避免阻塞机载控制回路)
+
+    def _headers(self) -> dict:
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+    def _chat(self, system: str, user: str, json_mode: bool = True) -> dict:
+        url = f"{self.endpoint}/v1/chat/completions"
+        body = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": 0.2,
+        }
+        if json_mode:
+            body["response_format"] = {"type": "json_object"}
+        resp = self._retry(_http_post, url, body, self._headers(), self.timeout_s)
+        content = resp["choices"][0]["message"]["content"]
+        return json.loads(content) if json_mode else {"text": content}
 
     def understand_instruction(self, text: str) -> dict:
-        # TODO:
-        # payload = {"model": self.model, "messages": [
-        #     {"role": "system", "content": "<理解指令的 system prompt>"},
-        #     {"role": "user", "content": text},
-        # ], "response_format": {"type": "json_object"}}
-        # resp = httpx.post(f"{self.endpoint}/v1/chat/completions",
-        #                   json=payload,
-        #                   headers={"Authorization": f"Bearer {self.api_key}"},
-        #                   timeout=self.timeout_s)
-        # return json.loads(resp.json()["choices"][0]["message"]["content"])
-        raise NotImplementedError
+        system = (
+            "你是机器人任务规划助手。把自然语言指令解析为结构化 JSON:\n"
+            '{"type": "...", "target": "...", "location": "...", "params": {}}'
+        )
+        user = f"指令:{text}\n返回 JSON,只包含字段。"
+        return self._chat(system, user, json_mode=True)
 
     def decompose(self, goal: dict, scene: dict) -> list[dict]:
-        # TODO: 同上,prompt 换成"任务分解 + 输出 JSON 技能序列"
-        raise NotImplementedError
+        system = (
+            "你是任务分解器。把目标分解为技能序列,返回 JSON 列表:\n"
+            '[{"id": "SK_WALK", "params": {...}}, ...]\n'
+            "可用技能:SK_WALK / SK_CLIMB / SK_REACH / SK_GRASP / SK_PLACE / SK_ASSEMBLE / SK_STAND / SK_TURN"
+        )
+        user = f"目标:{json.dumps(goal, ensure_ascii=False)}\n场景:{json.dumps(scene, ensure_ascii=False)}"
+        result = self._chat(system, user, json_mode=True)
+        # 期望 {"skills": [...]},兼容 list
+        if isinstance(result, dict) and "skills" in result:
+            return result["skills"]
+        if isinstance(result, list):
+            return result
+        return []
 
     def replan(self, failure: str, state: dict) -> list[dict]:
-        # TODO: 同上,prompt 换成"重规划"
-        raise NotImplementedError
+        system = "你是重规划器。给定失败类型和当前状态,返回新的技能序列 JSON 列表。"
+        user = f"失败:{failure}\n状态:{json.dumps(state, ensure_ascii=False)}"
+        result = self._chat(system, user, json_mode=True)
+        if isinstance(result, list):
+            return result
+        return result.get("skills", [])
 
 
 # ============================================================
-# Local 实现:本地推理(走 OpenAI-compatible 协议)
+# Local 实现(同样走 OpenAI-compatible,目标地址是 localhost)
 # ============================================================
 
-class LocalLLMClient(BaseLLMClient):
-    """本地 LLM 客户端。
-
-    假设本地推理服务走 OpenAI-compatible HTTP(覆盖 vLLM / TGI / llama.cpp server 等)。
-    本机地址默认 127.0.0.1:8000。
-    """
+class LocalLLMClient(RemoteLLMClient):
+    """本地 LLM 客户端(vLLM / TGI / llama.cpp server,OpenAI-compatible)。"""
 
     def __init__(
         self,
         endpoint: str = "http://127.0.0.1:8000",
         model: str = "local-model",
-        api_key: str = "EMPTY",   # 本地服务通常不校验
-        timeout_s: float = 5.0,   # 本地推理比云端慢,超时放宽
+        api_key: str = "EMPTY",
+        timeout_s: float = 5.0,
+        max_retries: int = 1,
     ):
-        super().__init__(timeout_s=timeout_s)
-        self.endpoint = endpoint.rstrip("/")
-        self.model = model
-        self.api_key = api_key
-        # TODO: httpx.Client 预热连接池
-
-    def understand_instruction(self, text: str) -> dict:
-        # TODO: 同 RemoteLLMClient,只是 endpoint 是本地服务
-        raise NotImplementedError
-
-    def decompose(self, goal: dict, scene: dict) -> list[dict]:
-        # TODO
-        raise NotImplementedError
-
-    def replan(self, failure: str, state: dict) -> list[dict]:
-        # TODO
-        raise NotImplementedError
+        super().__init__(
+            endpoint=endpoint, api_key=api_key, model=model,
+            timeout_s=timeout_s, max_retries=max_retries,
+        )
 
 
 # ============================================================
-# VLM 抽象 + 双实现(对齐 D3:VLM 单独接口)
+# VLM(基类 + Remote/Local)
 # ============================================================
 
 class BaseVLMClient(ABC):
-    """VLM 客户端统一接口。"""
-
     def __init__(self, timeout_s: float = 2.0, **kwargs):
         self.timeout_s = timeout_s
 
     @abstractmethod
     def understand_scene(self, image_bytes: bytes, prompt: str = "") -> dict:
-        """图像 -> 场景图 dict。"""
         ...
-
-    def close(self) -> None:
-        pass
 
 
 class RemoteVLMClient(BaseVLMClient):
-    """云端 VLM(走 OpenAI-compatible vision 接口,或专用 VLM API)。"""
+    """云端 VLM(走 OpenAI-compatible vision 接口)。"""
 
     def __init__(self, endpoint: str = "", api_key: str = "", model: str = "gpt-4o", timeout_s: float = 2.0):
         super().__init__(timeout_s=timeout_s)
-        self.endpoint = endpoint
+        self.endpoint = endpoint.rstrip("/")
         self.api_key = api_key
         self.model = model
-        # TODO: 图片转 base64 + multipart
 
-    def understand_scene(self, image_bytes: bytes, prompt: str = "") -> dict:
-        # TODO
-        raise NotImplementedError
+    def understand_scene(self, image_bytes: bytes, prompt: str = "描述场景中的物体和它们的空间关系,返回 JSON。") -> dict:
+        import base64
+        b64 = base64.b64encode(image_bytes).decode("ascii")
+        url = f"{self.endpoint}/v1/chat/completions"
+        body = {
+            "model": self.model,
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                ]}
+            ],
+            "response_format": {"type": "json_object"},
+        }
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        resp = _http_post(url, body, headers, self.timeout_s)
+        return json.loads(resp["choices"][0]["message"]["content"])
 
-
-class LocalVLMClient(BaseVLMClient):
-    """本地 VLM(LLaVA / InternVL 等 OpenAI-compatible 部署)。"""
-
-    def __init__(self, endpoint: str = "http://127.0.0.1:8001", model: str = "llava", timeout_s: float = 5.0):
-        super().__init__(timeout_s=timeout_s)
-        self.endpoint = endpoint
-        self.model = model
-        # TODO
+    def close(self) -> None:
+        # HTTP client 是 stateless 的,无需释放
         pass
 
-    def understand_scene(self, image_bytes: bytes, prompt: str = "") -> dict:
-        # TODO
-        raise NotImplementedError
+
+class LocalVLMClient(RemoteVLMClient):
+    def __init__(self, endpoint: str = "http://127.0.0.1:8001", model: str = "llava", timeout_s: float = 5.0):
+        super().__init__(endpoint=endpoint, api_key="EMPTY", model=model, timeout_s=timeout_s)
 
 
 # ============================================================
-# 工厂:按 config 选 Remote / Local
+# 工厂
 # ============================================================
 
 def make_llm_client(config: dict) -> BaseLLMClient:
-    """按 config["llm"] 自动选 Remote / Local 实现。
-
-    config 示例:
-      {"llm": {"mode": "remote", "endpoint": "https://api.deepseek.com/v1",
-               "api_key": "sk-...", "model": "deepseek-chat", "timeout_s": 2.0}}
-      {"llm": {"mode": "local", "endpoint": "http://127.0.0.1:8000",
-               "model": "Qwen2.5-7B-Instruct", "timeout_s": 5.0}}
-    """
     cfg = config.get("llm", {})
     mode = cfg.get("mode", "remote")
     if mode == "local":
@@ -198,17 +263,18 @@ def make_llm_client(config: dict) -> BaseLLMClient:
             model=cfg.get("model", "local-model"),
             api_key=cfg.get("api_key", "EMPTY"),
             timeout_s=cfg.get("timeout_s", 5.0),
+            max_retries=cfg.get("max_retries", 1),
         )
     return RemoteLLMClient(
         endpoint=cfg.get("endpoint", ""),
         api_key=cfg.get("api_key", ""),
         model=cfg.get("model", "gpt-4o-mini"),
         timeout_s=cfg.get("timeout_s", 2.0),
+        max_retries=cfg.get("max_retries", 1),
     )
 
 
 def make_vlm_client(config: dict) -> BaseVLMClient:
-    """VLM 工厂(同上,独立 endpoint)。"""
     cfg = config.get("vlm", {})
     mode = cfg.get("mode", "remote")
     if mode == "local":
@@ -223,3 +289,12 @@ def make_vlm_client(config: dict) -> BaseVLMClient:
         model=cfg.get("model", "gpt-4o"),
         timeout_s=cfg.get("timeout_s", 2.0),
     )
+
+
+__all__ = [
+    "BaseLLMClient", "BaseVLMClient",
+    "RemoteLLMClient", "LocalLLMClient",
+    "RemoteVLMClient", "LocalVLMClient",
+    "make_llm_client", "make_vlm_client",
+    "LLMError",
+]

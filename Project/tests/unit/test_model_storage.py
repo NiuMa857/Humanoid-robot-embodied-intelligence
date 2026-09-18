@@ -1,31 +1,64 @@
 """model_storage 单元测试。"""
-from __future__ import annotations
-from model_storage.storage_backend import LocalStorageBackend
-from model_storage.version_manager import VersionManager, VersionMetadata
+import sys
+sys.path.insert(0, ".")
+import os
+import tempfile
+
+from model_storage import (
+    LocalStorageBackend, ModelRegistry, VersionMetadata,
+    VersionManager, parse_semver, cmp_semver,
+)
 
 
-def test_local_storage_put_get(tmp_models_dir):
-    be = LocalStorageBackend(root=str(tmp_models_dir))
-    p = be.put("ppo/v0.1.0/model.onnx", b"fake-onnx-bytes")
-    assert p.exists()
-    assert be.get("ppo/v0.1.0/model.onnx") == b"fake-onnx-bytes"
-    assert be.exists("ppo/v0.1.0/model.onnx")
+def test_local_storage_crud():
+    with tempfile.TemporaryDirectory() as d:
+        be = LocalStorageBackend(root=d)
+        path = be.put("ppo/v0.1.0/model.onnx", b"x")
+        assert path.exists() and be.exists("ppo/v0.1.0/model.onnx")
+        assert be.get("ppo/v0.1.0/model.onnx") == b"x"
+        be.delete("ppo/v0.1.0/model.onnx")
+        assert not be.exists("ppo/v0.1.0/model.onnx")
 
 
-def test_local_storage_nested_keys(tmp_models_dir):
-    be = LocalStorageBackend(root=str(tmp_models_dir))
-    be.put("a/b/c/file.bin", b"x")
-    assert be.exists("a/b/c/file.bin")
+def test_local_storage_list():
+    with tempfile.TemporaryDirectory() as d:
+        be = LocalStorageBackend(root=d)
+        be.put("a/b/c.onnx", b"x")
+        be.put("a/d.pt", b"y")
+        keys = be.list("a")
+        assert "a/b/c.onnx" in keys
+        assert "a/d.pt" in keys
 
 
-def test_version_metadata_now_isoformat():
-    md = VersionMetadata.now()
-    # ISO 8601 格式以 Z 结尾
-    assert md.endswith("Z")
-    assert "T" in md
+def test_model_registry_register_and_retrieve():
+    with tempfile.TemporaryDirectory() as d:
+        be = LocalStorageBackend(root=d)
+        reg = ModelRegistry(be)
+        reg.register("walker", "0.1.0", b"bytes1", fmt="onnx",
+                     input_shape=[1, 33], output_shape=[1, 31])
+        reg.register("walker", "0.1.1", b"bytes2", fmt="onnx")
+        assert reg.get("walker", "latest").version == "0.1.1"
+        assert reg.get_bytes("walker", "0.1.0") == b"bytes1"
 
 
-def test_version_manager_init():
-    vm = VersionManager(initial="0.0.0")
-    md = vm.stamp()
-    assert md.semver == "0.0.0"
+def test_model_registry_delete():
+    with tempfile.TemporaryDirectory() as d:
+        be = LocalStorageBackend(root=d)
+        reg = ModelRegistry(be)
+        reg.register("walker", "0.1.0", b"bytes1", fmt="onnx")
+        reg.delete("walker", "0.1.0")
+        assert reg.get("walker", "0.1.0") is None
+
+
+def test_semver_compare():
+    assert cmp_semver("0.1.0", "0.1.1") == -1
+    assert cmp_semver("1.0.0", "0.99.99") == 1
+    assert cmp_semver("1.0.0-alpha", "1.0.0") == -1
+    assert cmp_semver("2.0.0", "2.0.0") == 0
+
+
+def test_version_manager_bump():
+    vm = VersionManager("1.0.0")
+    assert vm.bump("patch") == "1.0.1"
+    assert vm.bump("minor") == "1.1.0"
+    assert vm.bump("major") == "2.0.0"

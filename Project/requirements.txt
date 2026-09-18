@@ -1,0 +1,51 @@
+# Project/ 依赖清单
+#
+# 基础测试只需要 PyYAML,numpy,opencv-python(Anaconda 已预装)
+# 实跑训练 / 真机部署需要下面所有包
+
+# ===== 必需(已有) =====
+# 这些是 Anaconda 默认带的,基本都有:
+# - numpy
+# - PyYAML
+# - opencv-python (opencv-contrib-python)
+# - python 3.10+
+
+# ===== 训练必需(可选,跳过训练可不装) =====
+# torch>=2.0           # CleanRL 风格 PPO 自实现必需
+# torchvision           # (可选) 用预训练 backbone 做视觉
+
+# ===== 部署必需 =====
+# onnxruntime>=1.15     # ONNX 推理(CPU EP,RK3588 没 GPU)
+# pyrealsense2>=2.55    # RealSense D435i 驱动(Oli 用)
+# scipy                 # 数值
+
+# ===== 算法 RL 库(可选) =====
+# rsl_rl>=2.3           # rsl_rl 包装的 PPO/DWAQ
+
+# ===== 测试(可选,Anaconda 有 pytest 也行) =====
+# pytest>=7.0
+
+# ===== 仿真平台(可选,M1 才开始用) =====
+# isaacsim              # NVIDIA Isaac Sim 4.x(只支持 Linux + 部分 Win)
+# isaaclab              # Isaac Lab(RL 训练 + 仿真)
+# mujoco                # 可选备用
+# mujoco-python
+
+# ===== SDK 适配(等 LimX 官方 SDK) =====
+# oli-sdk  (暂未发布,占位)
+
+# ============================================================
+# 安装命令(按需选择):
+#
+# 基础跑测试:
+#   pip install pyyaml
+#
+# 训练:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#
+# 部署推理:
+#   pip install onnxruntime pyrealsense2
+#
+# 全部:
+#   pip install -r requirements.txt
+# ============================================================

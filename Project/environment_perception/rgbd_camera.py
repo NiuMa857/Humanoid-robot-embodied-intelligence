@@ -1,50 +1,114 @@
-"""RGB-D 相机驱动 + 标定(RealSense D435i,Readme §3.1)。
+"""RGB-D 相机驱动 + 标定(Readme §3.1)。
 
-负责:
-- 打开 / 关闭相机
-- 同步取 RGB + Depth
-- 内参 / 外参加载(标定 YAML)
-- 帧时间戳对齐
+支持 mock / real 两种模式。real 用 pyrealsense2(Oli 用 RealSense D435i,Readme §3.1)。
 """
 from __future__ import annotations
-import numpy as np
+import time
+from dataclasses import dataclass
+
+
+@dataclass
+class CameraIntrinsics:
+    """相机内参(简化版,RealSense 标准)。"""
+    fx: float = 0.0
+    fy: float = 0.0
+    cx: float = 0.0
+    cy: float = 0.0
+    width: int = 640
+    height: int = 480
 
 
 class RGBDCamera:
-    """RealSense D435i 抽象(Oli 头部 + 胸部各 1 台)。"""
+    """RealSense D435i 抽象(Oli 头部 + 胸部各 1 台,Readme §3.1)。"""
 
-    def __init__(self, serial: str = "", config: dict | None = None):
+    def __init__(
+        self,
+        serial: str = "",
+        mode: str = "mock",
+        width: int = 640,
+        height: int = 480,
+        fps: int = 30,
+    ):
         self.serial = serial
-        self.config = config or {}
-        self._pipeline = None  # TODO: pyrealsense2 pipeline
-        self._intrinsics = None  # TODO: 内参
+        self.mode = mode
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self._pipeline = None
+        self._intrinsics = CameraIntrinsics(width=width, height=height)
 
-    def open(self) -> None:
-        """启动相机 pipeline,读取内参。"""
-        # TODO: 用 pyrealsense2 启动
-        # config = rs.config()
-        # config.enable_device(self.serial)
-        # config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-        # config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
-        # self._pipeline.start(config)
-        pass
+        if mode == "real":
+            self._init_realsense()
 
-    def read(self) -> tuple[np.ndarray, np.ndarray, int]:
-        """同步读取一帧 RGB + Depth。
+    def _init_realsense(self) -> None:
+        """初始化 RealSense 设备。"""
+        try:
+            import pyrealsense2 as rs
+            ctx = rs.context()
+            if self.serial:
+                # 选指定序列号的设备
+                for dev in ctx.query_devices():
+                    if dev.get_info(rs.camera_info.serial_number) == self.serial:
+                        break
+            cfg = rs.config()
+            cfg.enable_stream(rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps)
+            cfg.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, self.fps)
+            self._pipeline = rs.pipeline()
+            self._pipeline.start(cfg)
+            # 取内参
+            profile = self._pipeline.get_active_profile()
+            color_stream = profile.get_stream(rs.stream.color)
+            intr = color_stream.as_video_stream_profile().get_intrinsics()
+            self._intrinsics = CameraIntrinsics(
+                fx=intr.fx, fy=intr.fy, cx=intr.ppx, cy=intr.ppy,
+                width=intr.width, height=intr.height,
+            )
+        except ImportError:
+            raise RuntimeError("pyrealsense2 not installed; install with `pip install pyrealsense2` or set mode='mock'")
+        except Exception as e:
+            raise RuntimeError(f"failed to init RealSense: {e}")
+
+    def read(self) -> tuple:
+        """同步读一帧 RGB + Depth。
 
         Returns:
-            rgb: HxWx3 uint8
+            rgb: HxWx3 uint8 (BGR 顺序,跟 OpenCV 一致)
             depth: HxW uint16(单位 mm)
-            timestamp_ns
+            timestamp_ns: int
         """
-        # TODO: frames = self._pipeline.wait_for_frames()
-        raise NotImplementedError
+        if self.mode == "real":
+            return self._read_realsense()
+        return self._read_mock()
+
+    def _read_realsense(self) -> tuple:
+        import numpy as np
+        frames = self._pipeline.wait_for_frames()
+        color = frames.get_color_frame()
+        depth = frames.get_depth_frame()
+        rgb = np.asanyarray(color.get_data())
+        d = np.asanyarray(depth.get_data())
+        ts = int(frames.get_timestamp() * 1e6)   # ms → ns
+        return rgb, d, ts
+
+    def _read_mock(self) -> tuple:
+        """mock 模式:返回固定大小黑色图 + 零深度。"""
+        try:
+            import numpy as np
+        except ImportError:
+            # 没 numpy 就返回 None
+            return None, None, time.time_ns()
+        rgb = np.zeros((self.height, self.width, 3), dtype="uint8")
+        depth = np.zeros((self.height, self.width), dtype="uint16")
+        return rgb, depth, time.time_ns()
 
     def close(self) -> None:
-        # TODO: self._pipeline.stop()
-        pass
+        if self._pipeline is not None:
+            self._pipeline.stop()
+            self._pipeline = None
 
     @property
-    def intrinsics(self):
-        # TODO: return self._intrinsics
-        raise NotImplementedError
+    def intrinsics(self) -> CameraIntrinsics:
+        return self._intrinsics
+
+
+__all__ = ["RGBDCamera", "CameraIntrinsics"]
