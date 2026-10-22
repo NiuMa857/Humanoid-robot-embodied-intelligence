@@ -97,7 +97,7 @@ def main():
             print(f"  - {f}")
         sys.exit(1)
     else:
-        print("ALL TESTS PASSED ✓")
+        print("ALL TESTS PASSED")
 
 
 if __name__ == "__main__":
