@@ -6,9 +6,12 @@
   - 降级:每种失败类型一个兜底技能序列
 """
 from __future__ import annotations
-from common.types import Skill, SkillSequence, RobotState, FailureType, ExecutionStatus, SceneGraph, to_dict
+from common.types import (
+    Skill, SkillSequence, RobotState, FailureType, ExecutionStatus, SceneGraph, TaskGoal, to_dict,
+)
 from common.logging import setup_logger
 from .llm_client import BaseLLMClient, LLMError
+from .skill_library import SkillLibrary
 
 _log = setup_logger("replanner")
 
@@ -16,8 +19,9 @@ _log = setup_logger("replanner")
 class Replanner:
     """失败检测 + 触发重规划。"""
 
-    def __init__(self, llm: BaseLLMClient):
+    def __init__(self, llm: BaseLLMClient, skill_library: SkillLibrary | None = None):
         self.llm = llm
+        self.skills = skill_library or SkillLibrary()
 
     def classify_failure(
         self,
@@ -50,44 +54,65 @@ class Replanner:
         failed_skill_id: str,
         current_state: RobotState,
         scene: SceneGraph | dict | None = None,
+        *,
+        goal: TaskGoal | dict | None = None,
+        completed: list[Skill] | None = None,
+        remaining: list[Skill] | None = None,
     ) -> SkillSequence:
-        """主入口。"""
+        """主入口。
+
+        Args:
+            goal: 原始任务目标(让 LLM 知道最终要达成什么)
+            completed: 已成功执行的技能
+            remaining: 失败技能之后尚未执行的技能
+        """
+        remaining = list(remaining or [])
         state = {
             "failed_skill": failed_skill_id,
             "base_pose": list(current_state.base_pose),
             "scene": to_dict(scene),
+            "goal": to_dict(goal),
+            "completed_skills": [to_dict(s) for s in completed or []],
+            "remaining_skills": [to_dict(s) for s in remaining],
         }
         # 先尝试 LLM
         try:
             raw = self.llm.replan(failure=failure, state=state)
-            return SkillSequence(
-                skills=[Skill(id=s.get("id", ""), params=s.get("params", {})) for s in raw]
-            )
         except (LLMError, Exception) as e:
             _log.warning(f"LLM replan failed ({type(e).__name__}), falling back")
-            return self._fallback(failure, failed_skill_id)
+            return self._fallback(failure, failed_skill_id, remaining)
+        seq, errors = self.skills.validate_sequence(raw)
+        if seq is None:
+            _log.warning(f"LLM replan output invalid ({'; '.join(errors)}), falling back")
+            return self._fallback(failure, failed_skill_id, remaining)
+        return seq
 
-    def _fallback(self, failure: str, failed_skill_id: str) -> SkillSequence:
-        """LLM 不可用时的硬编码兜底(Readme §10.2)。"""
+    def _fallback(self, failure: str, failed_skill_id: str, remaining: list[Skill] | None = None) -> SkillSequence:
+        """LLM 不可用时的硬编码兜底(Readme §10.2)。
+
+        恢复动作之后接上剩余计划继续执行;超时 / 未知失败则放弃剩余计划。
+        """
+        remaining = list(remaining or [])
+        retry = Skill(id=failed_skill_id, params={"retry": True})
         if failure == FailureType.F_STABILITY:
             # 失稳:先恢复站立
-            return SkillSequence(skills=[Skill(id="SK_STAND", params={})])
-        if failure == FailureType.F_GRASP:
+            recovery = [Skill(id="SK_STAND", params={}), retry]
+        elif failure == FailureType.F_GRASP:
             # 抓取失败:重试 1 次,然后放弃
-            return SkillSequence(skills=[Skill(id="SK_REACH", params={}), Skill(id="SK_GRASP", params={"retry": True})])
-        if failure == FailureType.F_COLLISION:
+            recovery = [Skill(id="SK_REACH", params={}), Skill(id="SK_GRASP", params={"retry": True})]
+        elif failure == FailureType.F_COLLISION:
             # 碰撞:反向运动 + 重新规划
-            return SkillSequence(skills=[Skill(id="SK_TURN", params={"angle_deg": 30}), Skill(id="SK_WALK", params={"retry": True})])
-        if failure == FailureType.F_TRAJECTORY:
+            recovery = [Skill(id="SK_TURN", params={"angle_deg": 30}), Skill(id="SK_WALK", params={"retry": True})]
+        elif failure == FailureType.F_TRAJECTORY:
             # 轨迹偏差:重做当前技能
-            return SkillSequence(skills=[Skill(id=failed_skill_id, params={"retry": True})])
-        if failure == FailureType.F_TIMEOUT:
+            recovery = [retry]
+        elif failure == FailureType.F_PERCEPTION:
+            # 感知失败:请求重感知
+            recovery = [Skill(id="SK_STAND", params={"wait_for_perception": True}), retry]
+        else:
             # 超时:放弃
             return SkillSequence(skills=[Skill(id="SK_STAND", params={})])
-        if failure == FailureType.F_PERCEPTION:
-            # 感知失败:请求重感知
-            return SkillSequence(skills=[Skill(id="SK_STAND", params={"wait_for_perception": True})])
-        return SkillSequence(skills=[Skill(id="SK_STAND", params={})])
+        return SkillSequence(skills=recovery + remaining)
 
 
 __all__ = ["Replanner"]

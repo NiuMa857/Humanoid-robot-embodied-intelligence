@@ -111,6 +111,149 @@ def test_llm_factory_reads_api_key_from_env():
         del os.environ["_TEST_OLI_LLM_KEY"]
 
 
+class _ScriptedLLM:
+    """按预设返回 decompose / replan 结果,并记录 replan 的入参。"""
+    def __init__(self, decompose_result=None, replan_result=None):
+        self.decompose_result = decompose_result
+        self.replan_result = replan_result
+        self.replan_states = []
+    def understand_instruction(self, text):
+        return {"type": "transport", "target": "box", "location": "workbench"}
+    def decompose(self, goal, scene):
+        return self.decompose_result
+    def replan(self, failure, state):
+        json.dumps(state, ensure_ascii=False)
+        self.replan_states.append(state)
+        if isinstance(self.replan_result, Exception):
+            raise self.replan_result
+        return self.replan_result
+    def close(self):
+        pass
+
+
+_TRANSPORT_PLAN = [
+    {"id": "SK_WALK", "params": {"target": "shelf"}},
+    {"id": "SK_REACH", "params": {"target": "box"}},
+    {"id": "SK_GRASP", "params": {"force": 10}},
+    {"id": "SK_WALK", "params": {"target": "workbench"}},
+    {"id": "SK_PLACE", "params": {}},
+]
+
+
+def test_task_decomposer_rejects_unknown_skill_and_falls_back():
+    llm = _ScriptedLLM(decompose_result=[{"id": "SK_WALK"}, {"id": "SK_FLY", "params": {}}])
+    seq = TaskDecomposer(llm=llm).decompose(TaskGoal(type="transport", target="box"), SceneGraph())
+    assert "SK_FLY" not in [s.id for s in seq.skills]
+    assert [s.id for s in seq.skills][0] == "SK_STAND"   # transport 模板
+
+
+def test_task_decomposer_rejects_malformed_output():
+    for bad in [[], None, {"skills": "x"}, [{"params": {}}], [{"id": "SK_WALK", "params": "fast"}]]:
+        llm = _ScriptedLLM(decompose_result=bad)
+        seq = TaskDecomposer(llm=llm).decompose(TaskGoal(type="climb"), SceneGraph())
+        assert [s.id for s in seq.skills] == ["SK_STAND", "SK_CLIMB"], bad
+
+
+def test_task_decomposer_fallback_fills_placeholders():
+    """模板里的 {target}/{location} 应被替换成 goal 的值,且不污染共享模板。"""
+    d = TaskDecomposer(llm=_FailingLLM())
+    seq = d.decompose(TaskGoal(type="transport", target="box", location="warehouse"), SceneGraph())
+    assert seq.skills[1].params["target"] == "warehouse"
+    assert seq.skills[2].params["target"] == "box"
+    seq2 = d.decompose(TaskGoal(type="transport", target="bolt", location="bench"), SceneGraph())
+    assert seq2.skills[1].params["target"] == "bench"
+    assert seq2.skills[2].params["target"] == "bolt"
+
+
+def test_task_decomposer_normalizes_skill_id():
+    llm = _ScriptedLLM(decompose_result=[{"id": " sk_walk ", "params": {"target": "a"}}])
+    seq = TaskDecomposer(llm=llm).decompose(TaskGoal(type="transport"), SceneGraph())
+    assert [s.id for s in seq.skills] == ["SK_WALK"]
+    assert seq.skills[0].params == {"target": "a"}
+
+
+def test_skill_library_validate_sequence():
+    lib = SkillLibrary()
+    seq, errors = lib.validate_sequence(_TRANSPORT_PLAN)
+    assert errors == [] and len(seq.skills) == 5
+    seq, errors = lib.validate_sequence([{"id": "SK_FLY"}])
+    assert seq is None and any("SK_FLY" in e for e in errors)
+    seq, errors = lib.validate_sequence([{"id": "SK_WALK"}] * 100)
+    assert seq is None and errors
+
+
+def test_replanner_sends_goal_and_progress_to_llm():
+    llm = _ScriptedLLM(replan_result=[{"id": "SK_GRASP", "params": {"retry": True}}])
+    state = RobotState(base_pose=(0, 0, 1.0, 0, 0, 0, 1))
+    Replanner(llm=llm).replan(
+        FailureType.F_GRASP, "SK_GRASP", state,
+        goal=TaskGoal(type="transport", target="box", location="workbench"),
+        completed=[Skill(id="SK_WALK"), Skill(id="SK_REACH")],
+        remaining=[Skill(id="SK_WALK", params={"target": "workbench"}), Skill(id="SK_PLACE")],
+    )
+    sent = llm.replan_states[0]
+    assert sent["goal"]["target"] == "box"
+    assert [s["id"] for s in sent["completed_skills"]] == ["SK_WALK", "SK_REACH"]
+    assert [s["id"] for s in sent["remaining_skills"]] == ["SK_WALK", "SK_PLACE"]
+
+
+def test_replanner_fallback_resumes_remaining_plan():
+    """LLM 不可用时:恢复动作 + 重试失败技能 + 继续剩余计划(超时则放弃)。"""
+    r = Replanner(llm=_FailingLLM())
+    state = RobotState(base_pose=(0, 0, 1.0, 0, 0, 0, 1))
+    remaining = [Skill(id="SK_WALK", params={"target": "workbench"}), Skill(id="SK_PLACE")]
+    seq = r.replan(FailureType.F_GRASP, "SK_GRASP", state, remaining=remaining)
+    assert [s.id for s in seq.skills] == ["SK_REACH", "SK_GRASP", "SK_WALK", "SK_PLACE"]
+    assert seq.skills[1].params.get("retry") is True
+    seq = r.replan(FailureType.F_TIMEOUT, "SK_GRASP", state, remaining=remaining)
+    assert [s.id for s in seq.skills] == ["SK_STAND"]
+
+
+def test_replanner_rejects_invalid_llm_output():
+    llm = _ScriptedLLM(replan_result=[{"id": "SK_TELEPORT"}])
+    state = RobotState(base_pose=(0, 0, 1.0, 0, 0, 0, 1))
+    seq = Replanner(llm=llm).replan(FailureType.F_TRAJECTORY, "SK_WALK", state)
+    assert [s.id for s in seq.skills] == ["SK_WALK"]
+
+
+def test_planning_node_tracks_progress_for_replan():
+    llm = _ScriptedLLM(decompose_result=_TRANSPORT_PLAN, replan_result=LLMError("down"))
+    pn = PlanningNode(config={})
+    pn.llm = llm
+    pn.decomposer.llm = llm
+    pn.replanner.llm = llm
+    state = RobotState(base_pose=(0, 0, 1.0, 0, 0, 0, 1))
+
+    pn.on_instruction("把箱子搬到工作台", SceneGraph())
+    pn.on_skill_completed("SK_WALK")
+    pn.on_skill_completed("SK_REACH")
+    new_seq = pn.on_failure(FailureType.F_GRASP, "SK_GRASP", state)
+
+    sent = llm.replan_states[0]
+    assert sent["goal"]["target"] == "box"
+    assert [s["id"] for s in sent["completed_skills"]] == ["SK_WALK", "SK_REACH"]
+    assert [s["id"] for s in sent["remaining_skills"]] == ["SK_WALK", "SK_PLACE"]
+    assert [s.id for s in new_seq.skills] == ["SK_REACH", "SK_GRASP", "SK_WALK", "SK_PLACE"]
+    assert pn.get_current_sequence() is new_seq
+    assert [s.id for s in pn.completed_skills] == ["SK_WALK", "SK_REACH"]
+
+
+def test_remote_llm_chat_url_handles_v1_suffix():
+    assert RemoteLLMClient(endpoint="https://api.deepseek.com/v1")._chat_url() == \
+        "https://api.deepseek.com/v1/chat/completions"
+    assert RemoteLLMClient(endpoint="http://127.0.0.1:8000/")._chat_url() == \
+        "http://127.0.0.1:8000/v1/chat/completions"
+
+
+def test_remote_llm_without_endpoint_fails_fast():
+    c = RemoteLLMClient(endpoint="", max_retries=3)
+    try:
+        c.decompose({}, {})
+        assert False, "should raise"
+    except LLMError:
+        pass
+
+
 def test_skill_library_basic():
     lib = SkillLibrary()
     assert "SK_WALK" in lib.list_ids()

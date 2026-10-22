@@ -55,6 +55,24 @@ def _http_get(url: str, headers: dict, timeout_s: float) -> bytes:
             return resp.read()
 
 
+def _chat_completions_url(endpoint: str) -> str:
+    """endpoint 可写成 https://host 或 https://host/v1,避免拼出 /v1/v1。"""
+    base = endpoint.rstrip("/")
+    if base.endswith("/v1"):
+        return f"{base}/chat/completions"
+    return f"{base}/v1/chat/completions"
+
+
+_SKILL_IDS_HINT = "可用技能:SK_WALK / SK_CLIMB / SK_REACH / SK_GRASP / SK_PLACE / SK_ASSEMBLE / SK_STAND / SK_TURN"
+
+
+def _extract_skills(result: Any) -> Any:
+    """从 LLM 返回中取技能列表:兼容 {"skills": [...]} 和裸 list;其余原样返回交给校验器报错。"""
+    if isinstance(result, dict) and "skills" in result:
+        return result["skills"]
+    return result
+
+
 # ============================================================
 # LLM 抽象基类
 # ============================================================
@@ -132,8 +150,13 @@ class RemoteLLMClient(BaseLLMClient):
             "Content-Type": "application/json",
         }
 
+    def _chat_url(self) -> str:
+        return _chat_completions_url(self.endpoint)
+
     def _chat(self, system: str, user: str, json_mode: bool = True) -> dict:
-        url = f"{self.endpoint}/v1/chat/completions"
+        if not self.endpoint:
+            raise LLMError("LLM endpoint not configured")
+        url = self._chat_url()
         body = {
             "model": self.model,
             "messages": [
@@ -157,27 +180,25 @@ class RemoteLLMClient(BaseLLMClient):
         return self._chat(system, user, json_mode=True)
 
     def decompose(self, goal: dict, scene: dict) -> list[dict]:
+        # response_format=json_object 要求顶层是对象,所以约定 {"skills": [...]}
         system = (
-            "你是任务分解器。把目标分解为技能序列,返回 JSON 列表:\n"
-            '[{"id": "SK_WALK", "params": {...}}, ...]\n'
-            "可用技能:SK_WALK / SK_CLIMB / SK_REACH / SK_GRASP / SK_PLACE / SK_ASSEMBLE / SK_STAND / SK_TURN"
+            "你是任务分解器。把目标分解为技能序列,返回 JSON 对象:\n"
+            '{"skills": [{"id": "SK_WALK", "params": {...}}, ...]}\n'
+            f"{_SKILL_IDS_HINT}"
         )
         user = f"目标:{json.dumps(goal, ensure_ascii=False)}\n场景:{json.dumps(scene, ensure_ascii=False)}"
-        result = self._chat(system, user, json_mode=True)
-        # 期望 {"skills": [...]},兼容 list
-        if isinstance(result, dict) and "skills" in result:
-            return result["skills"]
-        if isinstance(result, list):
-            return result
-        return []
+        return _extract_skills(self._chat(system, user, json_mode=True))
 
     def replan(self, failure: str, state: dict) -> list[dict]:
-        system = "你是重规划器。给定失败类型和当前状态,返回新的技能序列 JSON 列表。"
+        system = (
+            "你是重规划器。state 中包含原始目标 goal、已完成技能 completed_skills、"
+            "失败技能 failed_skill、剩余计划 remaining_skills 和场景 scene。\n"
+            "请给出从当前状态出发、最终完成 goal 的新技能序列(不要重复已完成的技能),返回 JSON 对象:\n"
+            '{"skills": [{"id": "...", "params": {...}}, ...]}\n'
+            f"{_SKILL_IDS_HINT}"
+        )
         user = f"失败:{failure}\n状态:{json.dumps(state, ensure_ascii=False)}"
-        result = self._chat(system, user, json_mode=True)
-        if isinstance(result, list):
-            return result
-        return result.get("skills", [])
+        return _extract_skills(self._chat(system, user, json_mode=True))
 
 
 # ============================================================
@@ -226,7 +247,9 @@ class RemoteVLMClient(BaseVLMClient):
     def understand_scene(self, image_bytes: bytes, prompt: str = "描述场景中的物体和它们的空间关系,返回 JSON。") -> dict:
         import base64
         b64 = base64.b64encode(image_bytes).decode("ascii")
-        url = f"{self.endpoint}/v1/chat/completions"
+        if not self.endpoint:
+            raise LLMError("VLM endpoint not configured")
+        url = _chat_completions_url(self.endpoint)
         body = {
             "model": self.model,
             "messages": [

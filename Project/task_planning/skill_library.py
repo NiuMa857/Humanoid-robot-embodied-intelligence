@@ -7,7 +7,8 @@
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
-from common.types import Skill, RobotState, JointState
+from typing import Any
+from common.types import Skill, SkillSequence, RobotState, JointState
 from common.logging import setup_logger
 
 _log = setup_logger("skill_library")
@@ -92,6 +93,37 @@ class SkillLibrary:
 
     def list_ids(self) -> list[str]:
         return list(self.SKILLS.keys())
+
+    MAX_SEQUENCE_LEN = 30
+
+    def validate_sequence(self, raw: Any) -> tuple[SkillSequence | None, list[str]]:
+        """校验 LLM 返回的原始技能列表。
+
+        规则:非空 list、长度 <= MAX_SEQUENCE_LEN、每项是含 id 的 dict、
+        id 在技能库中(大小写/空白归一化)、params 为 dict(缺省 {})。
+
+        Returns:
+            (SkillSequence, []) 校验通过;(None, errors) 任一项不合法。
+        """
+        if not isinstance(raw, list) or not raw:
+            return None, [f"expected non-empty list, got {type(raw).__name__}: {raw!r:.80}"]
+        if len(raw) > self.MAX_SEQUENCE_LEN:
+            return None, [f"sequence too long: {len(raw)} > {self.MAX_SEQUENCE_LEN}"]
+        skills, errors = [], []
+        for i, item in enumerate(raw):
+            if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+                errors.append(f"[{i}] missing skill id: {item!r:.80}")
+                continue
+            skill_id = item["id"].strip().upper()
+            if skill_id not in self.SKILLS:
+                errors.append(f"[{i}] unknown skill: {item['id']}")
+            params = item.get("params") or {}
+            if not isinstance(params, dict):
+                errors.append(f"[{i}] params must be dict, got {type(params).__name__}")
+            skills.append(Skill(id=skill_id, params=params))
+        if errors:
+            return None, errors
+        return SkillSequence(skills=skills), []
 
     def check_feasibility(self, skill: Skill, robot_state: RobotState) -> tuple[bool, str]:
         """检查机器人状态是否能执行该 skill。
