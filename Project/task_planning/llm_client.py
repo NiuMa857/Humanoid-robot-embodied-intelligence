@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 import json
+import os
 import time
 from abc import ABC, abstractmethod
 from typing import Any
@@ -254,6 +255,14 @@ class LocalVLMClient(RemoteVLMClient):
 # 工厂
 # ============================================================
 
+def _resolve_api_key(cfg: dict, default: str) -> str:
+    """显式 api_key 优先;为空时从 api_key_env 指定的环境变量读取。"""
+    if cfg.get("api_key"):
+        return cfg["api_key"]
+    env_name = cfg.get("api_key_env")
+    return os.environ.get(env_name, default) if env_name else default
+
+
 def make_llm_client(config: dict) -> BaseLLMClient:
     cfg = config.get("llm", {})
     mode = cfg.get("mode", "remote")
@@ -261,13 +270,13 @@ def make_llm_client(config: dict) -> BaseLLMClient:
         return LocalLLMClient(
             endpoint=cfg.get("endpoint", "http://127.0.0.1:8000"),
             model=cfg.get("model", "local-model"),
-            api_key=cfg.get("api_key", "EMPTY"),
+            api_key=_resolve_api_key(cfg, "EMPTY"),
             timeout_s=cfg.get("timeout_s", 5.0),
             max_retries=cfg.get("max_retries", 1),
         )
     return RemoteLLMClient(
         endpoint=cfg.get("endpoint", ""),
-        api_key=cfg.get("api_key", ""),
+        api_key=_resolve_api_key(cfg, ""),
         model=cfg.get("model", "gpt-4o-mini"),
         timeout_s=cfg.get("timeout_s", 2.0),
         max_retries=cfg.get("max_retries", 1),
@@ -285,7 +294,7 @@ def make_vlm_client(config: dict) -> BaseVLMClient:
         )
     return RemoteVLMClient(
         endpoint=cfg.get("endpoint", ""),
-        api_key=cfg.get("api_key", ""),
+        api_key=_resolve_api_key(cfg, ""),
         model=cfg.get("model", "gpt-4o"),
         timeout_s=cfg.get("timeout_s", 2.0),
     )

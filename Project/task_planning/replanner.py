@@ -6,7 +6,7 @@
   - 降级:每种失败类型一个兜底技能序列
 """
 from __future__ import annotations
-from common.types import Skill, SkillSequence, RobotState, FailureType, ExecutionStatus
+from common.types import Skill, SkillSequence, RobotState, FailureType, ExecutionStatus, SceneGraph, to_dict
 from common.logging import setup_logger
 from .llm_client import BaseLLMClient, LLMError
 
@@ -49,19 +49,17 @@ class Replanner:
         failure: str,
         failed_skill_id: str,
         current_state: RobotState,
-        scene: dict | None = None,
+        scene: SceneGraph | dict | None = None,
     ) -> SkillSequence:
         """主入口。"""
+        state = {
+            "failed_skill": failed_skill_id,
+            "base_pose": list(current_state.base_pose),
+            "scene": to_dict(scene),
+        }
         # 先尝试 LLM
         try:
-            raw = self.llm.replan(
-                failure=failure,
-                state={
-                    "failed_skill": failed_skill_id,
-                    "base_pose": current_state.base_pose,
-                    "scene": scene or {},
-                },
-            )
+            raw = self.llm.replan(failure=failure, state=state)
             return SkillSequence(
                 skills=[Skill(id=s.get("id", ""), params=s.get("params", {})) for s in raw]
             )

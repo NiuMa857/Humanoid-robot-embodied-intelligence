@@ -1,9 +1,11 @@
 """task_planning/ 单元测试:LLM 工厂 + fallback 路径。"""
 import sys
 sys.path.insert(0, ".")
+import json
+import os
 
 from common.types import (
-    TaskGoal, SceneGraph, Skill, RobotState, JointState, FailureType,
+    TaskGoal, SceneGraph, Skill, RobotState, JointState, FailureType, DetectedObject,
 )
 from task_planning import (
     TaskDecomposer, Replanner, SkillLibrary,
@@ -23,6 +25,90 @@ class _FailingLLM:
         raise LLMError("mock")
     def close(self):
         pass
+
+
+class _RecordingLLM:
+    """像真实客户端一样 json.dumps 入参,并记录调用。"""
+    def __init__(self):
+        self.decompose_calls = []
+        self.replan_calls = []
+    def understand_instruction(self, text):
+        return {"type": "transport", "target": "box", "location": "workbench"}
+    def decompose(self, goal, scene):
+        json.dumps(goal, ensure_ascii=False)
+        json.dumps(scene, ensure_ascii=False)
+        self.decompose_calls.append((goal, scene))
+        return [{"id": "SK_WALK", "params": {"target": "workbench"}}]
+    def replan(self, failure, state):
+        json.dumps(state, ensure_ascii=False)
+        self.replan_calls.append((failure, state))
+        return [{"id": "SK_STAND", "params": {}}]
+    def close(self):
+        pass
+
+
+def _scene_with_objects():
+    return SceneGraph(
+        objects=[DetectedObject(name="box", bbox_xyxy=(10, 20, 30, 40),
+                                pose_xyz_rpy=(0.5, 0.1, 0.8, 0, 0, 0), confidence=0.9)],
+        obstacles=[DetectedObject(name="pallet", pose_xyz_rpy=(1.0, 0, 0.1, 0, 0, 0))],
+        timestamp_ns=123,
+    )
+
+
+def test_task_decomposer_sends_serializable_scene_to_llm():
+    """含 DetectedObject 的场景应被序列化后传给 LLM,而不是悄悄降级到模板。"""
+    llm = _RecordingLLM()
+    seq = TaskDecomposer(llm=llm).decompose(TaskGoal(type="transport", target="box"), _scene_with_objects())
+    assert len(llm.decompose_calls) == 1
+    _, scene = llm.decompose_calls[0]
+    assert scene["objects"][0]["name"] == "box"
+    assert scene["obstacles"][0]["name"] == "pallet"
+    assert [s.id for s in seq.skills] == ["SK_WALK"]
+
+
+def test_replanner_sends_serializable_scene_to_llm():
+    llm = _RecordingLLM()
+    state = RobotState(base_pose=(0, 0, 1.0, 0, 0, 0, 1))
+    seq = Replanner(llm=llm).replan(FailureType.F_GRASP, "SK_GRASP", state, scene=_scene_with_objects())
+    assert len(llm.replan_calls) == 1
+    assert llm.replan_calls[0][1]["scene"]["objects"][0]["name"] == "box"
+    assert [s.id for s in seq.skills] == ["SK_STAND"]
+
+
+def test_planning_node_reads_nested_planning_config():
+    """default.yaml 把 llm/vlm 配置放在 planning: 下。"""
+    pn = PlanningNode(config={
+        "planning": {
+            "llm": {"mode": "local", "endpoint": "http://127.0.0.1:9000", "model": "qwen"},
+            "vlm": {"mode": "local", "endpoint": "http://127.0.0.1:9001"},
+        }
+    })
+    assert isinstance(pn.llm, LocalLLMClient)
+    assert pn.llm.endpoint == "http://127.0.0.1:9000"
+    assert pn.llm.model == "qwen"
+    assert pn.vlm.endpoint == "http://127.0.0.1:9001"
+    pn.shutdown()
+
+
+def test_planning_node_with_default_yaml():
+    from common.config import load_config
+    cfg = load_config("default")
+    pn = PlanningNode(config=cfg)
+    assert pn.llm.model == cfg["planning"]["llm"]["model"]
+    assert pn.vlm.model == cfg["planning"]["vlm"]["model"]
+    pn.shutdown()
+
+
+def test_llm_factory_reads_api_key_from_env():
+    os.environ["_TEST_OLI_LLM_KEY"] = "secret-from-env"
+    try:
+        c = make_llm_client({"llm": {"mode": "remote", "endpoint": "https://x", "api_key_env": "_TEST_OLI_LLM_KEY"}})
+        assert c.api_key == "secret-from-env"
+        c2 = make_llm_client({"llm": {"mode": "remote", "api_key": "explicit", "api_key_env": "_TEST_OLI_LLM_KEY"}})
+        assert c2.api_key == "explicit"
+    finally:
+        del os.environ["_TEST_OLI_LLM_KEY"]
 
 
 def test_skill_library_basic():

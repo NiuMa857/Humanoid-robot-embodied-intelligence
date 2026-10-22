@@ -3,7 +3,7 @@
 支持 LLM 调用 + 降级模板。
 """
 from __future__ import annotations
-from common.types import TaskGoal, SceneGraph, Skill, SkillSequence
+from common.types import TaskGoal, SceneGraph, Skill, SkillSequence, to_dict
 from common.logging import setup_logger
 from .llm_client import BaseLLMClient, LLMError
 
@@ -19,8 +19,9 @@ class TaskDecomposer:
 
     def decompose(self, goal: TaskGoal, scene: SceneGraph) -> SkillSequence:
         """主入口。LLM 失败自动降级。"""
+        goal_dict, scene_dict = to_dict(goal), to_dict(scene)
         try:
-            raw_skills = self.llm.decompose(goal.__dict__, scene.__dict__)
+            raw_skills = self.llm.decompose(goal_dict, scene_dict)
             return self._parse(raw_skills)
         except (LLMError, Exception) as e:
             _log.warning(f"LLM decompose failed ({type(e).__name__}: {e}), falling back to template")

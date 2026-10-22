@@ -5,6 +5,7 @@ from .types import (
     TaskGoal, Skill, SkillSequence,
     Trajectory, JointCommand,
     FailureType, ExecutionStatus,
+    to_dict,
 )
 from .config import load_config, env_override, clear_cache, get_project_root
 from .logging import setup_logger, JsonFormatter
@@ -15,7 +16,7 @@ __all__ = [
     "DetectedObject", "SceneGraph",
     "TaskGoal", "Skill", "SkillSequence",
     "Trajectory", "JointCommand",
-    "FailureType", "ExecutionStatus",
+    "FailureType", "ExecutionStatus", "to_dict",
     # config
     "load_config", "env_override", "clear_cache", "get_project_root",
     # logging

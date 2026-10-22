@@ -16,8 +16,10 @@ class PlanningNode:
 
     def __init__(self, config: dict | None = None):
         self.config = config or {}
-        self.llm = make_llm_client(self.config)
-        self.vlm = make_vlm_client(self.config)
+        # 支持传入完整 default.yaml(llm/vlm 在 planning: 下)或直接传 planning 段
+        planning_cfg = self.config.get("planning", self.config)
+        self.llm = make_llm_client(planning_cfg)
+        self.vlm = make_vlm_client(planning_cfg)
         self.skills = SkillLibrary()
         self.decomposer = TaskDecomposer(llm=self.llm)
         self.replanner = Replanner(llm=self.llm)

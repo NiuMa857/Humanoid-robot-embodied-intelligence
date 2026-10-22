@@ -3,8 +3,17 @@
 具体字段先留 TODO,等 Oli 官方 URDF/SDK 拿到后填实际 joint 名、限位等。
 """
 from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass, field, asdict, is_dataclass
+from typing import Any, Optional
+
+
+def to_dict(obj: Any) -> Any:
+    """dataclass(含嵌套)→ 可 JSON 序列化的 dict;dict / None 原样返回。"""
+    if obj is None:
+        return {}
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return asdict(obj)
+    return obj
 
 
 # ============================================================
