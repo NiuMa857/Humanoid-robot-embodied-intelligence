@@ -3,12 +3,11 @@
 # 基础测试只需要 PyYAML,numpy,opencv-python(Anaconda 已预装)
 # 实跑训练 / 真机部署需要下面所有包
 
-# ===== 必需(已有) =====
-# 这些是 Anaconda 默认带的,基本都有:
-# - numpy
-# - PyYAML
-# - opencv-python (opencv-contrib-python)
-# - python 3.10+
+# ===== 必需 =====
+# python 3.10+
+numpy
+pyyaml>=6.0
+# opencv-python (opencv-contrib-python)
 
 # ===== 训练必需(可选,跳过训练可不装) =====
 # torch>=2.0           # CleanRL 风格 PPO 自实现必需
