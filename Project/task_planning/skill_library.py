@@ -25,6 +25,8 @@ class SkillSpec:
     estimated_duration_s: float = 5.0
     failure_tolerance: dict = field(default_factory=dict)
     """失败容忍度:每个子阶段允许失败次数,超过触发 F_xxx"""
+    params: dict[str, str] = field(default_factory=dict)
+    """必填参数:参数名 → 含义(LLM 提示词与输出校验共用)"""
 
 
 class SkillLibrary:
@@ -36,18 +38,21 @@ class SkillLibrary:
             description="双足行走,速度<=5km/h",
             required_dofs=["left_leg", "right_leg"],
             timeout_s=60.0, estimated_duration_s=20.0,
+            params={"target": "目的地点名(或物体名,表示走到该物体所在地点)"},
         ),
         "SK_CLIMB": SkillSpec(
             id="SK_CLIMB", name="斜梯攀爬",
             description="斜坡/阶梯攀爬",
             required_dofs=["left_leg", "right_leg", "left_arm", "right_arm", "waist"],
             timeout_s=120.0, estimated_duration_s=60.0,
+            params={"target": "楼梯另一端的地点名"},
         ),
         "SK_REACH": SkillSpec(
             id="SK_REACH", name="手臂伸展",
             description="末端到达目标位置",
             required_dofs=["left_arm", "right_arm", "waist"],
             timeout_s=10.0, estimated_duration_s=3.0,
+            params={"target": "要够到的物体名(须在机器人当前地点)"},
         ),
         "SK_GRASP": SkillSpec(
             id="SK_GRASP", name="抓取",
@@ -56,6 +61,7 @@ class SkillLibrary:
             requires_ee=True,
             timeout_s=15.0, estimated_duration_s=5.0,
             failure_tolerance={"grasp_miss": 2},
+            params={"target": "要抓取的物体名(须先 SK_REACH 到该物体)"},
         ),
         "SK_PLACE": SkillSpec(
             id="SK_PLACE", name="放置",
@@ -63,6 +69,7 @@ class SkillLibrary:
             required_dofs=["left_arm", "right_arm"],
             requires_ee=True,
             timeout_s=15.0, estimated_duration_s=5.0,
+            params={"target": "放置地点名(须为机器人当前地点)"},
         ),
         "SK_ASSEMBLE": SkillSpec(
             id="SK_ASSEMBLE", name="装配",
@@ -71,6 +78,7 @@ class SkillLibrary:
             requires_ee=True,
             timeout_s=30.0, estimated_duration_s=10.0,
             failure_tolerance={"precision_miss": 3},
+            params={"target": "手中要装配的零件名", "into": "装配到的物体名(须在机器人当前地点)"},
         ),
         "SK_STAND": SkillSpec(
             id="SK_STAND", name="站立平衡",
@@ -93,6 +101,14 @@ class SkillLibrary:
 
     def list_ids(self) -> list[str]:
         return list(self.SKILLS.keys())
+
+    def prompt_hint(self) -> str:
+        """给 LLM 的技能清单(id + 含义 + 必填参数),与校验规则同源。"""
+        lines = ["可用技能(params 中必须给出列出的参数):"]
+        for spec in self.SKILLS.values():
+            ps = ", ".join(f"{k}: {v}" for k, v in spec.params.items()) or "无"
+            lines.append(f"- {spec.id}({spec.name}): {spec.description}; params: {ps}")
+        return "\n".join(lines)
 
     MAX_SEQUENCE_LEN = 30
 
@@ -120,6 +136,10 @@ class SkillLibrary:
             params = item.get("params") or {}
             if not isinstance(params, dict):
                 errors.append(f"[{i}] params must be dict, got {type(params).__name__}")
+            elif skill_id in self.SKILLS:
+                missing = [k for k in self.SKILLS[skill_id].params if params.get(k) in (None, "")]
+                if missing:
+                    errors.append(f"[{i}] {skill_id} missing params: {missing}")
             skills.append(Skill(id=skill_id, params=params))
         if errors:
             return None, errors

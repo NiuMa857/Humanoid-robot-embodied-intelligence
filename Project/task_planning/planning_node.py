@@ -33,21 +33,29 @@ class PlanningNode:
         self._completed: list[Skill] = []
         self._last_scene: SceneGraph | None = None
 
-    def on_instruction(self, text: str, scene: SceneGraph) -> SkillSequence:
-        """收到自然语言指令时:理解 → 分解 → 缓存 → 返回。"""
-        # 1. 理解
-        try:
-            goal_dict = self.llm.understand_instruction(text)
-        except Exception as e:
-            _log.warning(f"LLM understand_instruction failed: {e}; using empty goal")
-            goal_dict = {"type": "_default", "target": "", "location": ""}
+    def on_instruction(self, text: str, scene: SceneGraph, goal: TaskGoal | None = None) -> SkillSequence:
+        """收到指令时:理解 → 分解 → 缓存 → 返回。
 
-        goal = TaskGoal(
-            type=goal_dict.get("type", "_default"),
-            target=goal_dict.get("target", ""),
-            location=goal_dict.get("location", ""),
-            params=goal_dict.get("params", {}),
-        )
+        goal 非空时(结构化 API 指令,Readme §2.1)跳过 LLM 指令理解。
+        """
+        # 1. 理解
+        if goal is None:
+            try:
+                goal_dict = self.llm.understand_instruction(text)
+            except Exception as e:
+                _log.warning(f"LLM understand_instruction failed: {e}; using empty goal")
+                goal_dict = {"type": "_default", "target": "", "location": ""}
+
+            goal = TaskGoal(
+                type=goal_dict.get("type", "_default"),
+                target=goal_dict.get("target", ""),
+                location=goal_dict.get("location", ""),
+                params=dict(goal_dict.get("params") or {}),
+            )
+        # 原始指令随 goal 一起交给分解 / 重规划,避免多子任务等信息在结构化时丢失
+        if text and "instruction" not in goal.params:
+            goal = TaskGoal(type=goal.type, target=goal.target, location=goal.location,
+                            params={**goal.params, "instruction": text})
 
         # 2. 分解
         seq = self.decomposer.decompose(goal, scene)
@@ -76,14 +84,17 @@ class PlanningNode:
         failed_skill_id: str,
         current_state,
         scene: SceneGraph | None = None,
+        failure_detail: str = "",
     ) -> SkillSequence:
         """失败时带上目标 / 进度上下文重规划,替换当前序列。"""
         if scene is not None:
             self._last_scene = scene
         remaining: list[Skill] = []
+        failed_skill: Skill | None = None
         if self._current_seq is not None:
             current = self._current_skill()
             if current is not None and current.id == failed_skill_id:
+                failed_skill = current
                 remaining = self._current_seq.skills[self._cursor + 1:]
             else:
                 _log.warning(f"on_failure({failed_skill_id}) does not match current skill "
@@ -94,12 +105,19 @@ class PlanningNode:
             goal=self._current_goal,
             completed=self._completed,
             remaining=remaining,
+            failed_skill=failed_skill,
+            failure_detail=failure_detail,
         )
         self._set_sequence(new_seq)
         return new_seq
 
     def get_current_sequence(self) -> SkillSequence | None:
         return self._current_seq
+
+    @property
+    def next_skill(self) -> Skill | None:
+        """当前序列中下一个待执行的技能(序列执行完则 None)。"""
+        return self._current_skill()
 
     @property
     def completed_skills(self) -> list[Skill]:

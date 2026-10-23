@@ -54,24 +54,26 @@ class TaskDecomposer:
 
 # 缺省降级模板(简单示例,真用时按业务扩展)
 _DEFAULT_TEMPLATES: dict[str, list[dict]] = {
+    # target = 要操作的物体,location = 目的地点(assembly 中为被装配的物体)
     "transport": [
         {"id": "SK_STAND", "params": {}},
-        {"id": "SK_WALK", "params": {"target": "{location}"}},
+        {"id": "SK_WALK", "params": {"target": "{target}"}},
         {"id": "SK_REACH", "params": {"target": "{target}"}},
-        {"id": "SK_GRASP", "params": {"force": 10}},
-        {"id": "SK_WALK", "params": {"target": "home"}},
-        {"id": "SK_PLACE", "params": {}},
+        {"id": "SK_GRASP", "params": {"target": "{target}"}},
+        {"id": "SK_WALK", "params": {"target": "{location}"}},
+        {"id": "SK_PLACE", "params": {"target": "{location}"}},
     ],
     "assembly": [
         {"id": "SK_STAND", "params": {}},
-        {"id": "SK_WALK", "params": {"target": "{location}"}},
+        {"id": "SK_WALK", "params": {"target": "{target}"}},
         {"id": "SK_REACH", "params": {"target": "{target}"}},
-        {"id": "SK_GRASP", "params": {"force": 8}},
-        {"id": "SK_ASSEMBLE", "params": {"precision": "high"}},
+        {"id": "SK_GRASP", "params": {"target": "{target}"}},
+        {"id": "SK_WALK", "params": {"target": "{location}"}},
+        {"id": "SK_ASSEMBLE", "params": {"target": "{target}", "into": "{location}"}},
     ],
     "climb": [
         {"id": "SK_STAND", "params": {}},
-        {"id": "SK_CLIMB", "params": {"target": "stairs_30deg"}},
+        {"id": "SK_CLIMB", "params": {"target": "{location}"}},
     ],
     "_default": [
         {"id": "SK_STAND", "params": {}},

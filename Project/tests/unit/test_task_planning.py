@@ -5,7 +5,7 @@ import json
 import os
 
 from common.types import (
-    TaskGoal, SceneGraph, Skill, RobotState, JointState, FailureType, DetectedObject,
+    TaskGoal, SceneGraph, Skill, RobotState, JointState, FailureType, DetectedObject, to_dict,
 )
 from task_planning import (
     TaskDecomposer, Replanner, SkillLibrary,
@@ -144,9 +144,9 @@ class _ScriptedLLM:
 _TRANSPORT_PLAN = [
     {"id": "SK_WALK", "params": {"target": "shelf"}},
     {"id": "SK_REACH", "params": {"target": "box"}},
-    {"id": "SK_GRASP", "params": {"force": 10}},
+    {"id": "SK_GRASP", "params": {"target": "box"}},
     {"id": "SK_WALK", "params": {"target": "workbench"}},
-    {"id": "SK_PLACE", "params": {}},
+    {"id": "SK_PLACE", "params": {"target": "workbench"}},
 ]
 
 
@@ -168,11 +168,15 @@ def test_task_decomposer_fallback_fills_placeholders():
     """模板里的 {target}/{location} 应被替换成 goal 的值,且不污染共享模板。"""
     d = TaskDecomposer(llm=_FailingLLM())
     seq = d.decompose(TaskGoal(type="transport", target="box", location="warehouse"), SceneGraph())
-    assert seq.skills[1].params["target"] == "warehouse"
-    assert seq.skills[2].params["target"] == "box"
+    assert [s.params.get("target") for s in seq.skills] == [None, "box", "box", "box", "warehouse", "warehouse"]
     seq2 = d.decompose(TaskGoal(type="transport", target="bolt", location="bench"), SceneGraph())
-    assert seq2.skills[1].params["target"] == "bench"
-    assert seq2.skills[2].params["target"] == "bolt"
+    assert seq2.skills[1].params["target"] == "bolt"
+    assert seq2.skills[4].params["target"] == "bench"
+    # 模板输出本身也要通过技能库校验
+    for t in ("transport", "assembly", "climb"):
+        s = d.decompose(TaskGoal(type=t, target="x", location="y"), SceneGraph())
+        _, errors = SkillLibrary().validate_sequence([to_dict(k) for k in s.skills])
+        assert errors == [], (t, errors)
 
 
 def test_task_decomposer_normalizes_skill_id():
@@ -188,8 +192,13 @@ def test_skill_library_validate_sequence():
     assert errors == [] and len(seq.skills) == 5
     seq, errors = lib.validate_sequence([{"id": "SK_FLY"}])
     assert seq is None and any("SK_FLY" in e for e in errors)
-    seq, errors = lib.validate_sequence([{"id": "SK_WALK"}] * 100)
+    seq, errors = lib.validate_sequence([{"id": "SK_WALK", "params": {"target": "a"}}] * 100)
     assert seq is None and errors
+    seq, errors = lib.validate_sequence([{"id": "SK_GRASP", "params": {"force": 10}}])
+    assert seq is None and "missing params" in errors[0]
+    seq, errors = lib.validate_sequence([{"id": "SK_STAND"}])
+    assert errors == []
+    assert "SK_ASSEMBLE" in lib.prompt_hint() and "into" in lib.prompt_hint()
 
 
 def test_replanner_sends_goal_and_progress_to_llm():
@@ -241,9 +250,13 @@ def test_planning_node_tracks_progress_for_replan():
 
     sent = llm.replan_states[0]
     assert sent["goal"]["target"] == "box"
+    assert sent["failed_skill"] == {"id": "SK_GRASP", "params": {"target": "box"}}
     assert [s["id"] for s in sent["completed_skills"]] == ["SK_WALK", "SK_REACH"]
     assert [s["id"] for s in sent["remaining_skills"]] == ["SK_WALK", "SK_PLACE"]
     assert [s.id for s in new_seq.skills] == ["SK_REACH", "SK_GRASP", "SK_WALK", "SK_PLACE"]
+    # 兜底重试沿用失败技能的参数
+    assert new_seq.skills[0].params == {"target": "box"}
+    assert new_seq.skills[1].params == {"target": "box", "retry": True}
     assert pn.get_current_sequence() is new_seq
     assert [s.id for s in pn.completed_skills] == ["SK_WALK", "SK_REACH"]
 
@@ -253,6 +266,23 @@ def test_remote_llm_chat_url_handles_v1_suffix():
         "https://api.deepseek.com/v1/chat/completions"
     assert RemoteLLMClient(endpoint="http://127.0.0.1:8000/")._chat_url() == \
         "http://127.0.0.1:8000/v1/chat/completions"
+
+
+def test_parse_json_object_tolerates_concatenated_objects():
+    from task_planning.llm_client import _parse_json_object
+    assert _parse_json_object('{"a": 1}') == {"a": 1}
+    assert _parse_json_object('{"type": "transport"}\n{"type": "climb"}') == {"type": "transport"}
+
+
+def test_planning_node_passes_instruction_text_to_decomposer():
+    llm = _RecordingLLM()
+    pn = PlanningNode(config={})
+    pn.llm = pn.decomposer.llm = pn.replanner.llm = llm
+    pn.on_instruction("先把扳手送上平台,再搬箱子", SceneGraph())
+    goal_sent, _ = llm.decompose_calls[0]
+    assert goal_sent["params"]["instruction"] == "先把扳手送上平台,再搬箱子"
+    pn.on_instruction("搬箱子", SceneGraph(), goal=TaskGoal(type="transport", target="box", location="bench"))
+    assert llm.decompose_calls[1][0]["params"]["instruction"] == "搬箱子"
 
 
 def test_remote_llm_without_endpoint_fails_fast():

@@ -58,6 +58,8 @@ class Replanner:
         goal: TaskGoal | dict | None = None,
         completed: list[Skill] | None = None,
         remaining: list[Skill] | None = None,
+        failed_skill: Skill | None = None,
+        failure_detail: str = "",
     ) -> SkillSequence:
         """主入口。
 
@@ -65,10 +67,14 @@ class Replanner:
             goal: 原始任务目标(让 LLM 知道最终要达成什么)
             completed: 已成功执行的技能
             remaining: 失败技能之后尚未执行的技能
+            failed_skill: 失败技能(含参数,兜底重试时沿用其参数)
+            failure_detail: 执行层给出的失败原因文本
         """
         remaining = list(remaining or [])
+        failed = failed_skill or Skill(id=failed_skill_id)
         state = {
-            "failed_skill": failed_skill_id,
+            "failed_skill": to_dict(failed),
+            "failure_detail": failure_detail,
             "base_pose": list(current_state.base_pose),
             "scene": to_dict(scene),
             "goal": to_dict(goal),
@@ -80,29 +86,34 @@ class Replanner:
             raw = self.llm.replan(failure=failure, state=state)
         except (LLMError, Exception) as e:
             _log.warning(f"LLM replan failed ({type(e).__name__}), falling back")
-            return self._fallback(failure, failed_skill_id, remaining)
+            return self._fallback(failure, failed, remaining)
         seq, errors = self.skills.validate_sequence(raw)
         if seq is None:
             _log.warning(f"LLM replan output invalid ({'; '.join(errors)}), falling back")
-            return self._fallback(failure, failed_skill_id, remaining)
+            return self._fallback(failure, failed, remaining)
         return seq
 
-    def _fallback(self, failure: str, failed_skill_id: str, remaining: list[Skill] | None = None) -> SkillSequence:
+    def _fallback(self, failure: str, failed: Skill | str, remaining: list[Skill] | None = None) -> SkillSequence:
         """LLM 不可用时的硬编码兜底(Readme §10.2)。
 
         恢复动作之后接上剩余计划继续执行;超时 / 未知失败则放弃剩余计划。
+        重试沿用失败技能的原参数。
         """
+        if isinstance(failed, str):
+            failed = Skill(id=failed)
         remaining = list(remaining or [])
-        retry = Skill(id=failed_skill_id, params={"retry": True})
+        retry = Skill(id=failed.id, params={**failed.params, "retry": True})
         if failure == FailureType.F_STABILITY:
             # 失稳:先恢复站立
             recovery = [Skill(id="SK_STAND", params={}), retry]
-        elif failure == FailureType.F_GRASP:
+        elif failure == FailureType.F_GRASP and failed.id == "SK_GRASP":
             # 抓取失败:重试 1 次,然后放弃
-            recovery = [Skill(id="SK_REACH", params={}), Skill(id="SK_GRASP", params={"retry": True})]
+            recovery = [Skill(id="SK_REACH", params=dict(failed.params)), retry]
         elif failure == FailureType.F_COLLISION:
             # 碰撞:反向运动 + 重新规划
-            recovery = [Skill(id="SK_TURN", params={"angle_deg": 30}), Skill(id="SK_WALK", params={"retry": True})]
+            recovery = [Skill(id="SK_TURN", params={"angle_deg": 30}), retry]
+        elif failure == FailureType.F_GRASP:
+            recovery = [retry]
         elif failure == FailureType.F_TRAJECTORY:
             # 轨迹偏差:重做当前技能
             recovery = [retry]

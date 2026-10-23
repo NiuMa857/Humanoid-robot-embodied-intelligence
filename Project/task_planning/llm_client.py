@@ -10,6 +10,7 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 from common.logging import setup_logger
+from .skill_library import SkillLibrary
 
 _log = setup_logger("llm_client")
 
@@ -63,7 +64,25 @@ def _chat_completions_url(endpoint: str) -> str:
     return f"{base}/v1/chat/completions"
 
 
-_SKILL_IDS_HINT = "可用技能:SK_WALK / SK_CLIMB / SK_REACH / SK_GRASP / SK_PLACE / SK_ASSEMBLE / SK_STAND / SK_TURN"
+_SKILL_IDS_HINT = SkillLibrary().prompt_hint()
+
+TASK_TYPES = ("transport", "assembly", "climb")
+
+_SCENE_HINT = (
+    "场景说明:robot 为机器人当前状态(所在地点 / 手中物体 / 是否站立),objects 为物体及其所在地点,"
+    "walk_connections / climb_connections 为可步行 / 需攀爬的地点连接。"
+    "params 中的物体名和地点名必须使用场景中给出的名称。"
+)
+
+
+def _parse_json_object(content: str) -> Any:
+    """解析 LLM 的 JSON 输出;模型偶尔连续输出多个对象(如多子任务),此时取第一个并告警。"""
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        obj, end = json.JSONDecoder().raw_decode(content.strip())
+        _log.warning(f"LLM returned extra data after first JSON object ({len(content.strip()) - end} chars ignored)")
+        return obj
 
 
 def _extract_skills(result: Any) -> Any:
@@ -148,6 +167,8 @@ class RemoteLLMClient(BaseLLMClient):
         self.temperature = temperature
         # 厂商特有参数,原样并入请求体,例如 DeepSeek 的 {"thinking": {"type": "disabled"}}
         self.extra_body = dict(extra_body or {})
+        # 累计用量(评测统计调用次数 / token / 延迟)
+        self.usage = {"calls": 0, "errors": 0, "prompt_tokens": 0, "completion_tokens": 0, "latency_s": 0.0}
 
     def _headers(self) -> dict:
         return {
@@ -173,14 +194,28 @@ class RemoteLLMClient(BaseLLMClient):
         }
         if json_mode:
             body["response_format"] = {"type": "json_object"}
-        resp = self._retry(_http_post, url, body, self._headers(), self.timeout_s)
+        t0 = time.time()
+        try:
+            resp = self._retry(_http_post, url, body, self._headers(), self.timeout_s)
+        except LLMError:
+            self.usage["errors"] += 1
+            raise
+        finally:
+            self.usage["latency_s"] += time.time() - t0
+        self.usage["calls"] += 1
+        u = resp.get("usage") or {}
+        self.usage["prompt_tokens"] += u.get("prompt_tokens", 0)
+        self.usage["completion_tokens"] += u.get("completion_tokens", 0)
         content = resp["choices"][0]["message"]["content"]
-        return json.loads(content) if json_mode else {"text": content}
+        return _parse_json_object(content) if json_mode else {"text": content}
 
     def understand_instruction(self, text: str) -> dict:
         system = (
-            "你是机器人任务规划助手。把自然语言指令解析为结构化 JSON:\n"
-            '{"type": "...", "target": "...", "location": "...", "params": {}}'
+            "你是机器人任务规划助手。把自然语言指令解析为一个结构化 JSON 对象:\n"
+            '{"type": "...", "target": "...", "location": "...", "params": {}}\n'
+            f"type 必须是 {' / '.join(TASK_TYPES)} 之一;target 为要操作的物体,location 为目的地点。\n"
+            "若指令包含多个子任务,只返回一个对象:type/target/location 填第一个子任务,"
+            'params.subtasks 按顺序列出全部子任务(每项含 type/target/location)。'
         )
         user = f"指令:{text}\n返回 JSON,只包含字段。"
         return self._chat(system, user, json_mode=True)
@@ -190,7 +225,7 @@ class RemoteLLMClient(BaseLLMClient):
         system = (
             "你是任务分解器。把目标分解为技能序列,返回 JSON 对象:\n"
             '{"skills": [{"id": "SK_WALK", "params": {...}}, ...]}\n'
-            f"{_SKILL_IDS_HINT}"
+            f"{_SKILL_IDS_HINT}\n{_SCENE_HINT}"
         )
         user = f"目标:{json.dumps(goal, ensure_ascii=False)}\n场景:{json.dumps(scene, ensure_ascii=False)}"
         return _extract_skills(self._chat(system, user, json_mode=True))
@@ -198,10 +233,10 @@ class RemoteLLMClient(BaseLLMClient):
     def replan(self, failure: str, state: dict) -> list[dict]:
         system = (
             "你是重规划器。state 中包含原始目标 goal、已完成技能 completed_skills、"
-            "失败技能 failed_skill、剩余计划 remaining_skills 和场景 scene。\n"
+            "失败技能 failed_skill、失败原因 failure_detail、剩余计划 remaining_skills 和当前场景 scene。\n"
             "请给出从当前状态出发、最终完成 goal 的新技能序列(不要重复已完成的技能),返回 JSON 对象:\n"
             '{"skills": [{"id": "...", "params": {...}}, ...]}\n'
-            f"{_SKILL_IDS_HINT}"
+            f"{_SKILL_IDS_HINT}\n{_SCENE_HINT}"
         )
         user = f"失败:{failure}\n状态:{json.dumps(state, ensure_ascii=False)}"
         return _extract_skills(self._chat(system, user, json_mode=True))
