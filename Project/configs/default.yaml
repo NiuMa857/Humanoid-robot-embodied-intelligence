@@ -39,12 +39,16 @@ planning:
   llm:
     # QUESTIONS D1:同时支持 remote(云端)/ local(本地)两种调用
     mode: remote              # remote | local
-    endpoint: ""              # remote: 云端 OpenAI-compatible;local: 127.0.0.1:8000
-    api_key: ""
+    endpoint: https://api.deepseek.com   # remote: 云端 OpenAI-compatible;local: 127.0.0.1:8000
+    api_key: ""               # 不要写在这里;用环境变量 OLI_LLM_API_KEY
     api_key_env: OLI_LLM_API_KEY
-    model: gpt-4o-mini        # 切到 local 时换成 Qwen2.5 / LLaMA 等
-    timeout_s: 2.0
+    model: deepseek-flash     # DeepSeek-V4.1-Flash;可选 deepseek-v4-pro。切到 local 时换成 Qwen2.5 / LLaMA 等
+    timeout_s: 15.0           # 云端实测 1-3s(非思考)/ 3-20s(思考),2s 会频繁超时
     max_retries: 1
+    temperature: 0.0          # 实验可复现(思考模式下 DeepSeek 忽略该参数)
+    extra_body:               # 厂商特有参数,原样并入请求体
+      thinking:
+        type: disabled        # DeepSeek 默认开启思考模式;规划走慢系统但仍需低延迟
   vlm:
     mode: remote              # QUESTIONS D3:VLM 单独接口
     endpoint: ""

@@ -138,11 +138,16 @@ class RemoteLLMClient(BaseLLMClient):
         model: str = "gpt-4o-mini",
         timeout_s: float = 2.0,
         max_retries: int = 1,
+        temperature: float = 0.2,
+        extra_body: dict | None = None,
     ):
         super().__init__(timeout_s=timeout_s, max_retries=max_retries)
         self.endpoint = endpoint.rstrip("/")
         self.api_key = api_key
         self.model = model
+        self.temperature = temperature
+        # 厂商特有参数,原样并入请求体,例如 DeepSeek 的 {"thinking": {"type": "disabled"}}
+        self.extra_body = dict(extra_body or {})
 
     def _headers(self) -> dict:
         return {
@@ -163,7 +168,8 @@ class RemoteLLMClient(BaseLLMClient):
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "temperature": 0.2,
+            "temperature": self.temperature,
+            **self.extra_body,
         }
         if json_mode:
             body["response_format"] = {"type": "json_object"}
@@ -215,10 +221,13 @@ class LocalLLMClient(RemoteLLMClient):
         api_key: str = "EMPTY",
         timeout_s: float = 5.0,
         max_retries: int = 1,
+        temperature: float = 0.2,
+        extra_body: dict | None = None,
     ):
         super().__init__(
             endpoint=endpoint, api_key=api_key, model=model,
             timeout_s=timeout_s, max_retries=max_retries,
+            temperature=temperature, extra_body=extra_body,
         )
 
 
@@ -296,6 +305,8 @@ def make_llm_client(config: dict) -> BaseLLMClient:
             api_key=_resolve_api_key(cfg, "EMPTY"),
             timeout_s=cfg.get("timeout_s", 5.0),
             max_retries=cfg.get("max_retries", 1),
+            temperature=cfg.get("temperature", 0.2),
+            extra_body=cfg.get("extra_body"),
         )
     return RemoteLLMClient(
         endpoint=cfg.get("endpoint", ""),
@@ -303,6 +314,8 @@ def make_llm_client(config: dict) -> BaseLLMClient:
         model=cfg.get("model", "gpt-4o-mini"),
         timeout_s=cfg.get("timeout_s", 2.0),
         max_retries=cfg.get("max_retries", 1),
+        temperature=cfg.get("temperature", 0.2),
+        extra_body=cfg.get("extra_body"),
     )
 
 

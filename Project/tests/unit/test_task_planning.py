@@ -100,6 +100,16 @@ def test_planning_node_with_default_yaml():
     pn.shutdown()
 
 
+def test_llm_factory_passes_temperature_and_extra_body():
+    c = make_llm_client({"llm": {
+        "mode": "remote", "endpoint": "https://x", "temperature": 0.0,
+        "extra_body": {"thinking": {"type": "disabled"}},
+    }})
+    assert c.temperature == 0.0
+    assert c.extra_body == {"thinking": {"type": "disabled"}}
+    assert make_llm_client({"llm": {"mode": "local"}}).extra_body == {}
+
+
 def test_llm_factory_reads_api_key_from_env():
     os.environ["_TEST_OLI_LLM_KEY"] = "secret-from-env"
     try:
